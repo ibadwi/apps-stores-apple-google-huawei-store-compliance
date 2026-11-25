@@ -196,7 +196,10 @@ def detect(tree: Tree) -> AppRoots:
 PURPOSE_RULES = [
     # (code regex, cross-platform package regex, Info.plist key, label)
     (r"AVCaptureDevice|UIImagePickerController\.SourceType\.camera|\.sourceType\s*=\s*\.camera|DataScannerViewController", r"image_picker|\bcamera\b|expo-camera|react-native-vision-camera|react-native-image-picker|mobile_scanner|qr_code_scanner", "NSCameraUsageDescription", "camera"),
-    (r"PHPhotoLibrary\.requestAuthorization|PHPhotoLibrary\.authorizationStatus|PHAsset\.fetch", r"photo_manager|expo-media-library|@react-native-camera-roll", "NSPhotoLibraryUsageDescription", "photo library"),
+    # App Store Connect scans the binary: referencing UIImagePickerController or
+    # PHPhotoLibrary at all (even in a plugin, even unused) needs the key
+    # (ITMS-90683). file_picker links them unless the Podfile sets PICKER_MEDIA = false.
+    (r"PHPhotoLibrary|PHAsset\.fetch|UIImagePickerController", r"photo_manager|expo-media-library|@react-native-camera-roll|\bimage_picker\b|\bfile_picker\b", "NSPhotoLibraryUsageDescription", "photo library"),
     (r"CLLocationManager", r"geolocator|\blocation:|expo-location|react-native-geolocation|@react-native-community/geolocation", "NSLocationWhenInUseUsageDescription", "location"),
     (r"AVAudioRecorder|requestRecordPermission|AVAudioApplication\.requestRecordPermission|SFSpeechAudioBufferRecognitionRequest", r"\brecord:|flutter_sound|speech_to_text|expo-av|react-native-audio-recorder|@react-native-voice", "NSMicrophoneUsageDescription", "microphone"),
     (r"CNContactStore", r"flutter_contacts|contacts_service|expo-contacts|react-native-contacts", "NSContactsUsageDescription", "contacts"),
@@ -221,6 +224,41 @@ APPLE_LOGIN = r"ASAuthorizationAppleIDProvider|SignInWithAppleButton|sign_in_wit
 TRACKING_SDK = r"advertisingIdentifier|ASIdentifierManager|AppsFlyerLib|\bAdjust\.appDidLaunch|FBSDKCoreKit|GADMobileAds|GoogleMobileAds|google_mobile_ads|react-native-google-mobile-ads|appsflyer|adjust_sdk"
 APPLE_BILLING = r"Product\.products\(|SKProductsRequest|SKPaymentQueue|Transaction\.updates|\.purchase\(\s*options|in_app_purchase|react-native-iap|expo-in-app-purchases|RevenueCat|purchases_flutter|react-native-purchases"
 EXTERNAL_PAY = r"\bStripe\b|stripe_ios|flutter_stripe|@stripe/stripe-react-native|PayPal|Braintree|checkout\.stripe\.com"
+
+
+def native_dependency_files(tree: Tree, root: Path, app_root: Path) -> list[Path]:
+    """Native iOS sources of the app's dependencies, which the main walk skips.
+
+    App Store Connect checks the compiled binary, so an API referenced only
+    inside a plugin still needs its purpose string. Covers Flutter plugins
+    (listed in .flutter-plugins-dependencies, usually in the pub cache) and an
+    installed ios/Pods folder.
+    """
+    dirs: list[Path] = []
+    for base in {app_root, root, root.parent}:
+        deps = base / ".flutter-plugins-dependencies"
+        if deps.is_file():
+            try:
+                plugins = json.loads(deps.read_text(encoding="utf-8")).get("plugins", {})
+            except (OSError, ValueError):
+                plugins = {}
+            for plugin in plugins.get("ios", []) or []:
+                path = Path(plugin.get("path", ""))
+                dirs += [path / "ios", path / "darwin"]
+    for base in {root, app_root, app_root / "ios"}:
+        dirs.append(base / "Pods")
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for directory in dirs:
+        if not directory.is_dir() or directory in seen:
+            continue
+        seen.add(directory)
+        for dirpath, dirnames, filenames in os.walk(directory):
+            dirnames[:] = [d for d in dirnames if d not in {"Target Support Files", "Headers", ".git"} and not d.endswith(".xcframework") and not d.endswith(".framework")]
+            for name in filenames:
+                if name.endswith((".m", ".mm", ".swift")):
+                    files.append(Path(dirpath) / name)
+    return files
 
 
 def check_ios(report: Report, tree: Tree, root: Path, app_root: Path, stores: set[str]) -> None:
@@ -249,14 +287,35 @@ def check_ios(report: Report, tree: Tree, root: Path, app_root: Path, stores: se
                                file=rel(report_root(report), hit[0]), line=hit[1]))
 
     # Purpose strings
+    native = native_dependency_files(tree, root, app_root)
+    picker_media_off = re.search(r"PICKER_MEDIA\s*=\s*false", deps_text) is not None
     for code_rx, pkg_rx, key, label in PURPOSE_RULES:
+        if key in plist_text:
+            continue
         hit = tree.search(re.compile(code_rx), swift)
-        pkg_hit = re.search(pkg_rx, deps_text) if not hit else None
-        if (hit or pkg_hit) and key not in plist_text:
-            src = rel(report_root(report), hit[0]) if hit else "dependencies"
-            report.add(Finding("IOS-PURPOSE-STRING", "CRITICAL", ["apple"], f"Uses {label} but {key} is missing",
-                               f"Add {key} to Info.plist (or project.yml / app.json infoPlist) with a specific, localized explanation. Missing keys crash the app and fail review (5.1.1).",
-                               file=src, line=hit[1] if hit else 0))
+        dep_hit = None
+        if not hit:
+            dep_files = native
+            if key == "NSPhotoLibraryUsageDescription" and picker_media_off:
+                dep_files = [p for p in native if "file_picker" not in str(p)]
+            dep_hit = tree.search(re.compile(code_rx), dep_files)
+        pkg_hit = None
+        if not hit and not dep_hit:
+            deps_for_rule = deps_text
+            if key == "NSPhotoLibraryUsageDescription" and picker_media_off:
+                deps_for_rule = re.sub(r"\bfile_picker\b", "", deps_text)
+            pkg_hit = re.search(pkg_rx, deps_for_rule)
+        if hit or dep_hit or pkg_hit:
+            if hit:
+                src, line, why = rel(report_root(report), hit[0]), hit[1], f"Uses {label}"
+            elif dep_hit:
+                src, line = str(dep_hit[0]), dep_hit[1]
+                why = f"A native dependency references {label} APIs ({dep_hit[2]})"
+            else:
+                src, line, why = "dependencies", 0, f"Uses {label} (package {pkg_hit.group(0)})"
+            report.add(Finding("IOS-PURPOSE-STRING", "CRITICAL", ["apple"], f"{why} but {key} is missing",
+                               f"Add {key} to Info.plist (or project.yml / app.json infoPlist) with a specific, localized explanation. App Store Connect rejects the upload (ITMS-90683) even when the API is only linked by a library and never called; missing keys also crash the app (5.1.1).",
+                               file=src, line=line))
     for match in re.finditer(r"<key>(NS\w+UsageDescription)</key>\s*<string>([^<]*)</string>|(NS\w+UsageDescription):\s*[\"']?([^\n\"']*)", plist_text):
         key = match.group(1) or match.group(3)
         value = (match.group(2) if match.group(1) else match.group(4)) or ""

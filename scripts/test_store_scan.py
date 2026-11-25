@@ -219,5 +219,55 @@ class URLTests(unittest.TestCase):
         self.assertIn("URL-NOT-HTTPS", {f.id for f in report.findings})
 
 
+
+class FlutterPluginPurposeTests(unittest.TestCase):
+    """A purpose string required only because a plugin links the API."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.root = base / "app"
+        self.plugin = base / "pub-cache" / "some_picker-1.0.0"
+        write(self.root, "pubspec.yaml", "name: demo\ndependencies:\n  flutter:\n    sdk: flutter\n")
+        (self.root / "ios" / "Runner.xcodeproj").mkdir(parents=True)
+        write(self.root, "ios/Runner/Info.plist", "<plist><dict><key>CFBundleName</key><string>Demo</string></dict></plist>")
+        write(self.root, "ios/Podfile", "platform :ios, '15.0'\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def photo_findings(self):
+        report, _ = store_scan.scan(self.root, {"apple"}, [], TODAY)
+        return [f for f in report.findings if f.id == "IOS-PURPOSE-STRING" and "NSPhotoLibraryUsageDescription" in f.title]
+
+    def register_plugin(self, name="some_picker"):
+        write(self.plugin, "ios/Classes/Plugin.m", "UIImagePickerController *picker = [UIImagePickerController new];\n")
+        (self.root / ".flutter-plugins-dependencies").write_text(
+            '{"plugins": {"ios": [{"name": "%s", "path": "%s/"}]}}' % (name, self.plugin), encoding="utf-8")
+
+    def test_plugin_native_code_needs_the_key(self):
+        self.register_plugin()
+        found = self.photo_findings()
+        self.assertEqual(len(found), 1)
+        self.assertIn("native dependency", found[0].title)
+
+    def test_file_picker_package_needs_the_key(self):
+        write(self.root, "pubspec.yaml", "name: demo\ndependencies:\n  flutter:\n    sdk: flutter\n  file_picker: ^8.1.7\n")
+        self.assertEqual(len(self.photo_findings()), 1)
+
+    def test_file_picker_with_media_off_is_clean(self):
+        write(self.root, "pubspec.yaml", "name: demo\ndependencies:\n  flutter:\n    sdk: flutter\n  file_picker: ^8.1.7\n")
+        write(self.root, "ios/Podfile", "Pod::PICKER_MEDIA = false\nplatform :ios, '15.0'\n")
+        self.plugin = self.plugin.parent / "file_picker-8.1.7"
+        self.register_plugin("file_picker")
+        self.assertEqual(self.photo_findings(), [])
+
+    def test_key_present_is_clean(self):
+        self.register_plugin()
+        write(self.root, "ios/Runner/Info.plist",
+              "<plist><dict><key>NSPhotoLibraryUsageDescription</key><string>Pick a photo for the product you sell.</string></dict></plist>")
+        self.assertEqual(self.photo_findings(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
